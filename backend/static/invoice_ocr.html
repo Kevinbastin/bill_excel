@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head><title>Invoice OCR</title>
+<style>body{font-family:Arial;background:#667eea;min-height:100vh;display:flex;align-items:center;justify-content:center}
+.c{background:white;padding:40px;border-radius:8px;width:90%;max-width:600px}input,button{padding:10px;margin:10px 0;width:100%;border:1px solid #ddd;border-radius:4px}
+button{background:#667eea;color:white;cursor:pointer}.r{display:none;margin-top:20px;padding:15px;background:#f0f0f0;border-radius:4px}</style>
+</head>
+<body>
+<div class="c">
+<h1>📄 Invoice OCR</h1>
+<input type="file" id="f" accept="image/*">
+<button onclick="e()">Extract Table</button>
+<div id="r" class="r"></div>
+</div>
+<script>
+function e(){const file=document.getElementById('f').files[0];if(!file){alert('Select file');return}
+const fd=new FormData();fd.append('file',file);
+fetch('/api/extract',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{
+if(d.success||d.status==='success'){document.getElementById('r').style.display='block';
+document.getElementById('r').innerHTML='<h3>✓ Success!</h3><p>Data extracted</p><a href="'+d.download_url+'"><button>Download Excel</button></a>'}
+else alert('Error: '+(d.detail||d.error||'Unknown error'))}).catch(e=>alert('Error: '+e.message))}
+</script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+venv/
+env/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+outputs/
+uploads/
+node_modules/
+*.xlsx
+bill/
