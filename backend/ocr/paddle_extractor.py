@@ -20,15 +20,29 @@ class PaddleExtractor:
     """
     PP-Structure table extractor (restored first-pass behavior + optional crop second-pass).
 
-    - First pass: same config that worked for you (lang="ch", recovery=False, layout=True).
-    - Second pass: optional, runs on cropped table bbox (layout=False, recovery=True) only if needed.
-    - Returns both 'canonicalrows' and 'canonical_rows' to satisfy ExcelWriter.
+    FIX:
+    - Ensure continuation/wrapped text stays in the SAME cell (Description) for the same line item:
+      if SL is empty and row is mostly text -> append to previous row's description.
+    - Remove duplicated continuation text that leaks into Qty column (common PP-Structure artifact).
     """
 
     HEADER_KEYWORDS = (
+        # generic
         "id", "item", "code", "desc", "description",
-        "qty", "quantity", "rate", "price", "amount", "total",
-        "product", "service", "hsn", "sac", "taxable", "igst", "cgst", "sgst", "cess"
+        "qty", "quantity", "qnty", "units", "um",
+        "rate", "price", "amount", "total",
+        "product", "service", "hsn", "sac", "taxable", "igst", "cgst", "sgst", "cess",
+        # your sample invoice headers
+        "no.", "no", "net price", "net worth", "vat", "vat [%]", "gross worth"
+    )
+
+    STOP_KEYS = (
+        "subtotal", "sub total", "sub-total",
+        "tax", "tax rate", "gst", "vat", "igst", "cgst", "sgst",
+        "grand total", "total due", "amount due", "balance due",
+        "round off", "roundoff", "discount", "shipping", "handling", "delivery",
+        "net amount", "gross amount",
+        "summary"
     )
 
     def __init__(self, use_gpu: bool = False):
@@ -39,8 +53,8 @@ class PaddleExtractor:
         self.doc_engine = PPStructure(
             use_cuda=use_gpu,
             use_pdf2image_cuda=use_gpu,
-            lang="ch",          # your previous default that worked
-            recovery=False,     # previous default
+            lang="ch",
+            recovery=False,
             layout=True,
             table=True,
             ocr=True,
@@ -50,8 +64,8 @@ class PaddleExtractor:
         self.table_engine = PPStructure(
             use_cuda=use_gpu,
             use_pdf2image_cuda=use_gpu,
-            lang="ch",          # stay consistent to minimize regressions
-            recovery=True,      # stronger table recovery when zoomed on table
+            lang="ch",
+            recovery=True,
             layout=False,
             table=True,
             ocr=True,
@@ -82,7 +96,6 @@ class PaddleExtractor:
             doc_result = self.doc_engine(img, return_ocr_result_in_table=True)
             logger.info(f"✅ PP-Structure complete: {len(doc_result)} regions found")
 
-            # Safe: img is optional; second pass will use it if provided
             table_blocks = self.extract_and_reconstruct_tables(doc_result, img)
             extracted_data = self._parse_results(doc_result, table_blocks)
             return {"status": "success", "data": extracted_data}
@@ -139,7 +152,10 @@ class PaddleExtractor:
                 raw_grid = self._grid_from_cells(cells)
                 if raw_grid:
                     canonical_rows = self._ensure_header_row(raw_grid)
-                    logger.info(f"  ✅ SUCCESS: {len(canonical_rows)} rows × {max(len(r) for r in canonical_rows)} cols")
+                    canonical_rows = self._merge_continuations_and_fix_dupes(canonical_rows)
+                    logger.info(
+                        f"  ✅ SUCCESS: {len(canonical_rows)} rows × {max(len(r) for r in canonical_rows)} cols"
+                    )
 
             # METHOD 1b: optional second pass on crop if first pass failed
             if canonical_rows is None and img is not None:
@@ -158,6 +174,7 @@ class PaddleExtractor:
                                 raw_grid = self._grid_from_cells(cells2)
                                 if raw_grid:
                                     canonical_rows = self._ensure_header_row(raw_grid)
+                                    canonical_rows = self._merge_continuations_and_fix_dupes(canonical_rows)
                                     logger.info("  ✅ SECOND PASS SUCCESS")
                     except Exception as e:
                         logger.debug(f"  ⚠️ Second pass failed: {e}")
@@ -168,6 +185,7 @@ class PaddleExtractor:
                 raw_grid = self._parse_html_table(html)
                 if raw_grid:
                     canonical_rows = self._ensure_header_row(raw_grid)
+                    canonical_rows = self._merge_continuations_and_fix_dupes(canonical_rows)
                     logger.info(f"  ✅ HTML rows: {len(canonical_rows)}")
 
             # METHOD 3: tokens
@@ -201,6 +219,67 @@ class PaddleExtractor:
         logger.info("\n" + "=" * 80)
         logger.info(f"📊 Total tables extracted: {len(out)}")
         logger.info("=" * 80)
+        return out
+
+    # ==================== FIX: keep continuation in same cell ====================
+
+    def _merge_continuations_and_fix_dupes(self, grid: List[List[str]]) -> List[List[str]]:
+        """
+        Works on any grid (wide or 5-col). Goal:
+        - If a row has no SL/ID but has description-like text, append it to previous row's description cell.
+        - If the same continuation text appears in another column (often Qty), clear that duplicate.
+        """
+        if not grid or len(grid) < 3:
+            return grid
+
+        header = grid[0]
+        ncols = max(len(r) for r in grid)
+        fixed = []
+        for r in grid:
+            rr = list(r) + [""] * (ncols - len(r))
+            fixed.append(rr[:ncols])
+
+        # find likely columns
+        def find_col(keys: Tuple[str, ...]) -> Optional[int]:
+            for i, c in enumerate(header):
+                t = (c or "").strip().lower()
+                if any(k in t for k in keys):
+                    return i
+            return None
+
+        i_sl = find_col(("sl", "s.no", "no", "id"))
+        i_desc = find_col(("description", "desc", "item", "product", "particulars"))
+        i_qty = find_col(("qty", "quantity", "um", "units"))
+
+        # if desc not found, fall back to column 1 (common: No. at 0, Desc at 1)
+        if i_desc is None:
+            i_desc = 1 if ncols > 1 else 0
+
+        out = [fixed[0]]
+        for row in fixed[1:]:
+            sl = (row[i_sl].strip() if (i_sl is not None and i_sl < ncols) else "").strip()
+            desc = (row[i_desc] or "").strip()
+
+            # consider a "continuation" row if SL empty and desc has text
+            # and the row doesn't look like a totals/summary separator
+            row_text = " ".join((c or "").strip().lower() for c in row if (c or "").strip())
+            is_stop = any(k in row_text for k in self.STOP_KEYS)
+
+            # If SL empty and desc exists -> continuation row
+            if (not sl) and desc and (not is_stop) and len(out) > 1:
+                # append to previous description
+                out[-1][i_desc] = (out[-1][i_desc].strip() + " " + desc).strip()
+
+                # clear duplicates of the same continuation in other columns (e.g. Qty)
+                if i_qty is not None and i_qty < ncols:
+                    if (row[i_qty] or "").strip() == desc:
+                        row[i_qty] = ""
+
+                # do not keep this row
+                continue
+
+            out.append(row)
+
         return out
 
     # ==================== HELPERS ====================
@@ -269,7 +348,9 @@ class PaddleExtractor:
                 cur.append(cell)
                 cur_y = float(np.median([c["yc"] for c in cur]))
             else:
-                rows.append(cur); cur = [cell]; cur_y = cell["yc"]
+                rows.append(cur)
+                cur = [cell]
+                cur_y = cell["yc"]
         rows.append(cur)
         for r in rows:
             r.sort(key=lambda c: c["xc"])
@@ -278,7 +359,14 @@ class PaddleExtractor:
         col_x = [c["xc"] for c in anchor_row]
         if not col_x:
             return None
-        col_x = self._merge_close_1d(col_x, min_gap=max(8.0, float(np.median(np.diff(sorted(col_x))) if len(col_x) > 1 else 15.0) * 0.35))
+
+        col_x = self._merge_close_1d(
+            col_x,
+            min_gap=max(
+                8.0,
+                float(np.median(np.diff(sorted(col_x))) if len(col_x) > 1 else 15.0) * 0.35
+            )
+        )
         ncols = len(col_x)
         if ncols <= 0:
             return None
@@ -314,8 +402,6 @@ class PaddleExtractor:
         diffs = np.diff(ys)
         med = float(np.median(diffs)) if len(diffs) else 15.0
         return max(6.0, min(30.0, med * 0.45))
-
-    # ---------- HTML / tokens / fields (unchanged) ----------
 
     def _ensure_header_row(self, grid: List[List[str]]) -> List[List[str]]:
         if not grid:
@@ -356,17 +442,13 @@ class PaddleExtractor:
             return str(txt).strip(), score
         if isinstance(item, (list, tuple)):
             if len(item) >= 2 and isinstance(item[0], str):
-                txt = item[0]; score = item[1]
-                try: score = float(score) if score is not None else None
-                except Exception: score = None
+                txt = item[0]
+                score = item[1]
+                try:
+                    score = float(score) if score is not None else None
+                except Exception:
+                    score = None
                 return str(txt).strip(), score
-            if len(item) >= 1 and isinstance(item[0], (list, tuple)):
-                inner = item[0]
-                if len(inner) >= 2 and isinstance(inner[0], str):
-                    txt = inner[0]; score = inner[1]
-                    try: score = float(score) if score is not None else None
-                    except Exception: score = None
-                    return str(txt).strip(), score
             if len(item) >= 1 and isinstance(item[0], str):
                 return item[0].strip(), None
         return "", None
@@ -383,7 +465,8 @@ class PaddleExtractor:
             x1, y1, x2, y2 = bbox
             return float(x1), float(y1), float(x2), float(y2)
         if isinstance(bbox, (list, tuple)) and len(bbox) == 4 and all(isinstance(p, (list, tuple)) and len(p) == 2 for p in bbox):
-            xs = [float(p[0]) for p in bbox]; ys = [float(p[1]) for p in bbox]
+            xs = [float(p[0]) for p in bbox]
+            ys = [float(p[1]) for p in bbox]
             return min(xs), min(ys), max(xs), max(ys)
         return None
 
@@ -424,20 +507,28 @@ class PaddleExtractor:
                 _boxes, rec_res = region_res
                 for item in rec_res or []:
                     txt, score = self._extract_text_score(item)
-                    if txt: text_lines.append(txt)
-                    if score is not None: confidences.append(float(score))
+                    if txt:
+                        text_lines.append(txt)
+                    if score is not None:
+                        confidences.append(float(score))
             elif isinstance(region_res, list):
                 for item in region_res:
                     txt, score = self._extract_text_score(item)
-                    if txt: text_lines.append(txt)
-                    if score is not None: confidences.append(float(score))
+                    if txt:
+                        text_lines.append(txt)
+                    if score is not None:
+                        confidences.append(float(score))
             elif isinstance(region_res, dict):
                 txt = region_res.get("text") or region_res.get("transcription")
-                if txt: text_lines.append(str(txt).strip())
+                if txt:
+                    text_lines.append(str(txt).strip())
                 score = region_res.get("score") or region_res.get("confidence")
                 if score is not None:
-                    try: confidences.append(float(score))
-                    except Exception: pass
+                    try:
+                        confidences.append(float(score))
+                    except Exception:
+                        pass
+
         full_text_str = "\n".join([t for t in text_lines if t]).strip()
         fields = self._extract_key_fields(full_text_str)
         avg_confidence = float(np.mean(confidences)) if confidences else 0.0
@@ -449,6 +540,7 @@ class PaddleExtractor:
             "table_count": len(table_blocks),
             "text_items": len(text_lines),
         }
+
     @staticmethod
     def grid_to_html(grid: List[List[str]]) -> str:
         if not grid:
@@ -472,6 +564,7 @@ class PaddleExtractor:
     @staticmethod
     def _extract_key_fields(text: str) -> Dict[str, Optional[str]]:
         fields: Dict[str, Optional[str]] = {}
+
         inv_patterns = [
             r"(?:Invoice|Bill|Invoice No|Inv|INV)[\s#:]*([A-Z0-9\-\/]+)",
             r"(?:Invoice Number)[\s:]*([0-9A-Z\-\/]+)",
@@ -482,6 +575,7 @@ class PaddleExtractor:
             if m:
                 fields["invoice_number"] = m.group(1).strip()
                 break
+
         date_patterns = [
             r"(?:Date|Dated)[\s:]*(\d{1,2}[-/]\d{1,2}[-/]\d{4})",
             r"(\d{4}-\d{1,2}-\d{1,2})",
@@ -492,6 +586,7 @@ class PaddleExtractor:
             if m:
                 fields["date"] = m.group(1)
                 break
+
         amount_patterns = [
             r"(?:Total|Grand Total|Amount Due|TOTAL)[\s:]*[₹$]?\s*([0-9,]+\.?\d*)",
             r"[₹$]\s*([0-9,]+\.?\d*)",
@@ -502,17 +597,23 @@ class PaddleExtractor:
             if m:
                 fields["total_amount"] = m.group(1).strip()
                 break
+
         gstin_match = re.search(r"(?:GSTIN|GST)[\s:]*([0-9A-Z]{15})", text, re.IGNORECASE)
         fields["gstin"] = gstin_match.group(1) if gstin_match else None
+
         po_match = re.search(r"(?:PO|P\.O\.|Purchase Order)[\s#:]*([A-Z0-9\-]+)", text, re.IGNORECASE)
         fields["po_number"] = po_match.group(1) if po_match else None
-        due_date_patterns = [r"(?:Due Date|DueDate|Payment Due)[\s:]*(\d{1,2}[-/]\d{1,2}[-/]\d{4})"]
+
+        due_date_patterns = [
+            r"(?:Due Date|DueDate|Payment Due)[\s:]*(\d{1,2}[-/]\d{1,2}[-/]\d{4})"
+        ]
         fields["due_date"] = None
         for pattern in due_date_patterns:
             m = re.search(pattern, text, re.IGNORECASE)
             if m:
                 fields["due_date"] = m.group(1)
                 break
+
         vendor_lines = [line.strip() for line in text.split("\n") if len(line.strip()) > 5][:2]
         fields["vendor"] = " ".join(vendor_lines) if vendor_lines else None
         return fields

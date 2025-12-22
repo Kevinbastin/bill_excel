@@ -251,8 +251,7 @@ if uploaded_file:
                             key="download_btn"
                         )
                         
-                        # Show success animation
-                        st.balloons()
+                        
                         
                         logger.info(f"Successfully extracted {uploaded_file.name}")
                         
